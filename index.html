@@ -10,7 +10,6 @@
 <title>optical-table.app</title>
 <meta name="description" content="optical-table.app: quickly create 2D optical layouts and export publication-grade figures.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <meta name="theme-color" content="#14171A">
 <meta property="og:type" content="website">
@@ -331,6 +330,8 @@ main.nopanel #panelTab svg{transform:rotate(180deg)}
   #panelTab svg{transform:rotate(90deg)}
   main.nopanel #panelTab svg{transform:rotate(-90deg)} }
 </style>
+<script data-goatcounter="https://sstucker.goatcounter.com/count"
+        async src="//gc.zgo.at/count.js"></script>
 </head>
 <body>
 <main>
@@ -529,6 +530,9 @@ function fmtWL(list){
    the way in, "branch" the owner's other output, "free" the unused port. Plus
    follow/branch/arms for its outputs. Distance and deflection are derived (§4).
    tail0: the joined beam's former end length, for disconnecting (§10).
+   aim:false (a source, a fold or a fiber's output end): "Aim at next" off. The optic is not
+   aimed at the link after it (§4): its angle, place and distance stay as set, so the beam can
+   leave off the joined path on purpose. Absent means on; files store only false.
    A `fiber` runs from input end A (d mm on) to output end B at (ox, oy) model mm,
    leaving at orot°; B is absolute, not relative to the source. Links at a fiber:
    "back" enters B and leaves A, "fwd" enters A and leaves B; loose:true marks
@@ -714,11 +718,13 @@ function newElement(key, base){
 /* Change an element's type in place, dropping and filling fields. A mirror made a splitter or dichroic keeps its optics on the reflected path. */
 function convertElement(el, type){
   const defs = ELEMENTS[type].defaults(), fromMirror = FOLDS.has(el.type) && !BRANCHING.has(el.type);
+  const keepAim = el.aim === false && FOLDS.has(el.type) && FOLDS.has(type);   // still a fold: "Aim at next" stays off
   for (const k of Object.keys(el))
     if (!COMMON_KEYS.has(k) && !(k in defs) && !k.startsWith("_")) delete el[k];
   el.type = type;
   for (const k in defs) if (el[k] === undefined) el[k] = defs[k];
   if (fromMirror && BRANCHING.has(type)) el.follow = "reflected";
+  if (keepAim) el.aim = false;
 }
 /* Fill in defaults so every source and element has its type's full field set (files store only
    differences). Run on anything loaded; makeElement and convertElement keep it true. */
@@ -1516,6 +1522,8 @@ function nearestSpan(cable, m){
    its real orientation. To hit it, the last mirror before (else the source) is *aimed*:
    reaching sets its angle; joining also slides it so the output leaves by along's port (§2).
    Solved values are written to the scene (el.d, el.angle, src.rot, src.x/y), marked _aim/_aimD.
+   With aim:false the optic is left as set and marked _aimOff (the link it would aim at); the
+   beam leaving it is `free`, off its links' lines on purpose, so they aren't faulted for that.
 
    Waiting. Walks are queued. A sub-beam meeting an unplaced optic is requeued alone while
    its parent goes on; a main walk is requeued whole. A walk stuck through a full round is
@@ -1558,7 +1566,9 @@ function runWalk(T, task){
     T.refLam = mean(nms);                        // axis λ = mean of the beam's source
     aimSource(T, src);
     T.emitters.push({ src, seg:T.segs.length });
-    walk(T, { list:src.chain, holder:src, key:"tail", depth:0, src }, emitBeam(src, nms));
+    const beam = emitBeam(src, nms);
+    if (src._aimOff) beam.free = true;           // not aimed: off its links' lines on purpose
+    walk(T, { list:src.chain, holder:src, key:"tail", depth:0, src }, beam);
   } else {
     T.refLam = task.refLam;
     walk(T, task.route, cloneBeam(task.beam));
@@ -1594,12 +1604,12 @@ function scanScene(sc){
   const known = new Set();
   (function visit(list){
     for (const el of list || []){
-      delete el._aim; delete el._aimD; delete el._aimB; delete el._miss; delete el._d;
+      delete el._aim; delete el._aimD; delete el._aimB; delete el._aimOff; delete el._miss; delete el._d;
       if (el.type !== "link") known.add(el.id);
       visit(el.branch); if (el.arms) for (const k in el.arms) visit(el.arms[k].list);
     }
   })(sc.sources.flatMap(s => s.chain));
-  for (const src of sc.sources){ delete src._aim; delete src._aimD; }
+  for (const src of sc.sources){ delete src._aim; delete src._aimD; delete src._aimOff; }
   return known;
 }
 
@@ -1646,8 +1656,26 @@ function arrivalDir(link, target){
   if (!FOLDS.has(t)) return E;
   return (!split || link.follow === "reflected") ? reflectDir(E, target.N) : E;   // a reflection is its own inverse
 }
+/* The link an optic would aim at, without placing its target: the first down `sub` before any axis-bending element. */
+function nextLink(sub){
+  for (const x of sub){
+    if (x.type === "link") return x;
+    if (!STRAIGHT.has(x.type)) return null;
+  }
+  return null;
+}
+/* "Aim at next" off (o.aim === false): left as set, marked _aimOff. True if a link follows, so the beam leaves free.
+   It still waits for the target as aiming would, so the walk order (and drawing order) is the same either way. */
+function aimOff(T, o, sub){
+  if (o.aim !== false) return false;
+  const l = nextLink(sub); if (!l) return false;
+  lookAhead(T, sub);
+  o._aimOff = l.id;
+  return true;
+}
 /* A source aims its chain: turned to the target and, given a direction, moved onto that line (upstream). */
 function aimSource(T, src){
+  if (aimOff(T, src, src.chain)) return;
   const a = lookAhead(T, src.chain); if (!a) return;
   const Q = a.Q;
   if (a.Darr){
@@ -1663,7 +1691,8 @@ function aimSource(T, src){
 }
 /* A fiber's output end aims like a source (_aimB). */
 function aimFiber(T, el, sub){
-  const a = lookAhead(T, sub); if (!a) return;
+  if (aimOff(T, el, sub)) return true;
+  const a = lookAhead(T, sub); if (!a) return false;
   const Q = a.Q, B = { x:el.ox, y:el.oy };
   if (a.Darr){
     let t = (B.x - Q.x)*a.Darr.x + (B.y - Q.y)*a.Darr.y;
@@ -1671,14 +1700,16 @@ function aimFiber(T, el, sub){
     el.ox = r3(Q.x + a.Darr.x*t); el.oy = r3(Q.y + a.Darr.y*t); el.orot = degOf(a.Darr); el._aimB = true;
   } else {
     const v = { x:Q.x - B.x, y:Q.y - B.y };
-    if (Math.hypot(v.x, v.y) < 1e-9) return;
+    if (Math.hypot(v.x, v.y) < 1e-9) return false;
     el.orot = degOf(v);
   }
   el._aim = a.link.id;
+  return false;
 }
-/* A fold aims its reflected list. The beam is at the previous node; the fold el.d down it. */
+/* A fold aims its reflected list. The beam is at the previous node; the fold el.d down it. True if left free (aim off). */
 function aimFold(T, beam, el, sub){
-  const a = lookAhead(T, sub); if (!a) return;
+  if (aimOff(T, el, sub)) return true;
+  const a = lookAhead(T, sub); if (!a) return false;
   const Q = a.Q, P0 = beam.p, D = beam.dir;
   if (a.Darr){                                   // slide to where the incoming line meets the required one
     const den = D.x*a.Darr.y - D.y*a.Darr.x;
@@ -1688,10 +1719,11 @@ function aimFold(T, beam, el, sub){
     }
   }
   const P = { x:P0.x + D.x*el.d, y:P0.y + D.y*el.d }, v = { x:Q.x - P.x, y:Q.y - P.y };
-  if (Math.hypot(v.x, v.y) < 1e-9) return;
+  if (Math.hypot(v.x, v.y) < 1e-9) return false;
   const ang = Math.round(signedDeg(D, unit(v))*1e4)/1e4;
-  if (Math.abs(ang) < 1) return;                 // target straight ahead: a fold can't reach it
+  if (Math.abs(ang) < 1) return false;           // target straight ahead: a fold can't reach it
   el.angle = ang; el._aim = a.link.id;
+  return false;
 }
 const steerable = el => FOLDS.has(el.type) && (!BRANCHING.has(el.type) || el.follow === "reflected");
 
@@ -1758,11 +1790,13 @@ function walk(T, route, beam){
     if (el.type === "polygon"){ T.nodeById.set(el.id, stepPolygon(T, route, beam, el)); endsOn = null; continue; }   // places its own node
     if (el.type === "retro"){ T.nodeById.set(el.id, stepRetro(T, route, beam, el)); endsOn = null; continue; }       // so does a roof
     if (el.type === "pair"){ T.nodeById.set(el.id, stepPair(T, route, beam, el)); endsOn = null; continue; }         // and a mirror pair
+    let freeOut = "";                            // the output left free by "Aim at next" off: "main" or "branch"
     if (FOLDS.has(el.type)){                     // aim the output the next link lies on
-      if (steerable(el)) aimFold(T, beam, el, list.slice(i + 1));
-      else if (BRANCHING.has(el.type)) aimFold(T, beam, el, el.branch || []);   // the branch is the reflection
+      if (steerable(el)){ if (aimFold(T, beam, el, list.slice(i + 1))) freeOut = "main"; }
+      else if (BRANCHING.has(el.type)){ if (aimFold(T, beam, el, el.branch || [])) freeOut = "branch"; }   // the branch is the reflection
     }
-    else if (el.type === "fiber") aimFiber(T, el, list.slice(i + 1));         // a fiber's output end, as a source
+    else if (el.type === "fiber"){ if (aimFiber(T, el, list.slice(i + 1))) freeOut = "main"; }   // a fiber's output end, as a source
+    if (freeOut === "branch") beam.freeBranch = true;   // read by stepFold as it starts the sub-beam
     const seg = advance(T, route, beam, el.d, el.d, el, "free");
     const node = { el, p:{ ...beam.p }, dirIn:{ ...beam.dir }, segIn:seg.i };
     T.nodes.push(node); T.nodeById.set(el.id, node);
@@ -1770,6 +1804,8 @@ function walk(T, route, beam){
     clipToAperture(T, beam, el);
     STEP[el.type](T, route, beam, el, node, seg);
     if (!node.dirOut) node.dirOut = { ...beam.dir };
+    delete beam.freeBranch;
+    if (freeOut === "main") beam.free = true;
     endsOn = beam.absorbed ? el : null;
   }
   const holder = route.holder, key = route.key;
@@ -1822,7 +1858,7 @@ function stepLink(T, route, beam, link){
   const side = project(Q, beam.p, leftNormal(D)), hit = faceHit(target, beam.p, D);
   const d = poly || !hit ? project(Q, beam.p, D) : hit.t;
   link._miss = d < 0.5 ? "behind"
-             : !hit || hit.off > hit.half || (link.along && Math.abs(side) > 0.1) ? "misses" : "";
+             : !hit || hit.off > hit.half || (link.along && !beam.free && Math.abs(side) > 0.1) ? "misses" : "";
   link._d = r3(d);
   const eff = { ...ref, id:link.id, d:Math.max(0.5, d), follow:link.follow, sub:link.sub,
                 branch:(link.branch || (link.branch = [])), branchTail:link.branchTail, arms:(link.arms || (link.arms = {})) };
@@ -2146,8 +2182,9 @@ function stepFiberVisit(T, route, beam, link, target){
   const at = { x:beam.p.x + D.x*t, y:beam.p.y + D.y*t }, side = project(entry.p, beam.p, leftNormal(D));
   let off = project(at, entry.p, leftNormal(N)), tilt = signedAngle(N, D);
   const half = (entry.end === "collimator" ? collimatorR(ref.ap) : FC.nutR) + FACE_SLACK;
-  link._miss = Math.abs(off) > half || (!link.loose && Math.abs(side) > 0.1) ? "misses" : "";
-  if (!link.loose && !link._miss && Math.abs(tilt) < 1e-3){ off = 0; tilt = 0; }
+  link._miss = Math.abs(off) > half || (!link.loose && !beam.free && Math.abs(side) > 0.1) ? "misses" : "";
+  if (!link.loose && !link._miss && (beam.free ? Math.abs(tilt) < 5e-6 && Math.abs(off) < 5e-3 : Math.abs(tilt) < 1e-3)){ off = 0; tilt = 0; }   // aimed: on axis, not rounding
+                                                 // error; a free beam only within the rounding of stored angles (1e-4°) and places (1 µm)
   link._d = r3(t);
   const seg = advance(T, route, beam, t, t, link, "free");
   const node = { el:link, ref, eff:ref, link:true, p:{ ...beam.p }, dirIn:{ ...D }, segIn:seg.i };
@@ -2209,7 +2246,8 @@ function stepFold(T, route, beam, el, node, seg){
     const [main, other] = el.follow === "reflected" ? [refl, trans] : [trans, refl];
     if (route.depth < MAX_BRANCH_DEPTH)
       walkSub(T, { list:el.branch || (el.branch = []), holder:node.el, key:"branchTail", depth:route.depth + 1, src:route.src },   // node.el: the list element (a link, when el is its effective form)
-           { p:{ ...beam.p }, dir:{ ...other.dir }, chans:other.chans, rays:other.rays, cut:N, ap:el.ap, last:seg.i });
+           { p:{ ...beam.p }, dir:{ ...other.dir }, chans:other.chans, rays:other.rays, cut:N, ap:el.ap, last:seg.i,
+             free:!!(beam.free || beam.freeBranch) });
     beam.dir = { ...main.dir }; beam.chans = main.chans; beam.rays = main.rays;
     node.dirOut = { ...dRefl };                  // grip and glyph show the reflection
     node.dirMain = { ...main.dir };              // where the list continues, for joins
@@ -2301,7 +2339,7 @@ function stepGrating(T, route, beam, el, node, seg){
     if (k === main || !axisDir.has(k)) continue;
     const arm = gratingArmFor(el, k), out = diffract(k, beam.chans, beam.rays);
     walkSub(T, { list:arm.list, holder:arm, key:"tail", depth:route.depth + 1, src:route.src },
-         { p:{ ...beam.p }, dir:{ ...axisDir.get(k) }, chans:out.chans, rays:out.rays, cut:N, ap:el.ap, last:seg.i });
+         { p:{ ...beam.p }, dir:{ ...axisDir.get(k) }, chans:out.chans, rays:out.rays, cut:N, ap:el.ap, last:seg.i, free:!!beam.free });
   }
   if (main == null){ beam.chans = []; beam.rays = []; return; }
   const out = diffract(main, beam.chans, beam.rays);
@@ -2457,7 +2495,7 @@ function stepRetroVisit(T, route, beam, link, target){
   const D = beam.dir, ax = retroPath(beam.p, D, target.retro);
   if (!ax){ link._miss = "misses"; return; }     // the beam runs on
   if (ax.t1 < 0.5){ link._miss = "behind"; return; }
-  link._miss = link.along && Math.abs(project(faceOf(link, target), beam.p, leftNormal(D))) > 0.1 ? "misses" : "";
+  link._miss = link.along && !beam.free && Math.abs(project(faceOf(link, target), beam.p, leftNormal(D))) > 0.1 ? "misses" : "";
   link._d = r3(ax.t1);
   const node = stepRetro(T, route, beam, target.el, link, target.retro);
   node.ref = target.el; node.eff = target.el; node.link = true;
@@ -2498,7 +2536,7 @@ function stepPairVisit(T, route, beam, link, target){
   let hit = pairHit(g, beam.p, D);
   if (!hit){ link._miss = "misses"; return; }    // the beam runs on
   if (hit.t < 0.5){ link._miss = "behind"; return; }
-  link._miss = link.along && Math.abs(project(faceOf(link, target), beam.p, leftNormal(D))) > 0.1 ? "misses" : "";
+  link._miss = link.along && !beam.free && Math.abs(project(faceOf(link, target), beam.p, leftNormal(D))) > 0.1 ? "misses" : "";
   link._d = r3(hit.t);
   let seg = advance(T, route, beam, hit.t, hit.t, link, "free");
   const node = { el:link, ref:target.el, eff:target.el, link:true, p:{ ...beam.p }, dirIn:D, segIn:seg.i };
@@ -2957,7 +2995,70 @@ function rayEnds({ tr, P, K, mark }){
 }
 const strokeOf = (pal, c) => pal.dark ? rgb(c) : mixc(c, .28, 0);   // a line drawn in colour c: darkened on paper
 const rayStroke = (pal, src, nm) => strokeOf(pal, lineColor(src, nm));
-const rayOpacity = pow => fx(0.9*(0.3 + 0.7*pow));
+/* Light that shares a path adds up. The trace follows each route through the splitters on its
+   own, so where routes recombine (a PBS, a splitter met again) their pieces lie on the same rays.
+   Items { key, rays:[{ a, b, pc }] } (screen ends, fan order) on the same ray lines, same way,
+   are cut where any of them starts or ends; each stretch is drawn once carrying the summed power
+   of all that cover it. Items that only partly share their rays, or whose ends interleave
+   differently from ray to ray, are left as they are. */
+const COINCIDE_DIR = 1e-6;                       // 1 − cos of the largest angle still "the same way"
+function sumCoincident(items, tol = SAME_RAY){
+  const unit = (a, b) => { const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy); return L > 1e-9 ? [dx/L, dy/L] : null; };
+  const off = (p, o, w) => Math.abs((p[0] - o[0])*w[1] - (p[1] - o[1])*w[0]);   // distance from the line through o along w
+  const info = items.map(it => ({ it, w:it.rays.map(r => unit(r.a, r.b)) }));
+  const same = (X, Y) => X.it.key === Y.it.key && X.it.rays.length === Y.it.rays.length
+    && X.it.rays.every((r, i) => { const s = Y.it.rays[i], w = X.w[i], v = Y.w[i];
+         return r.pc.ri === s.pc.ri && w && v && 1 - (w[0]*v[0] + w[1]*v[1]) < COINCIDE_DIR
+           && off(s.a, r.a, w) < tol && off(s.b, r.a, w) < tol; });
+  const buckets = new Map();                     // by key and heading: only these can coincide
+  for (const X of info){
+    const w = X.w[0], h = w ? Math.round(Math.atan2(w[1], w[0])*200) : "x";
+    const k = X.it.key + "|" + h;
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(X);
+  }
+  const clusters = [];
+  for (const list of buckets.values()){
+    const open = [];
+    for (const X of list){
+      const c = open.find(c => same(c[0], X));
+      if (c) c.push(X); else { const n = [X]; open.push(n); clusters.push(n); }
+    }
+  }
+  const out = [];
+  for (const c of clusters){
+    if (c.length === 1){ out.push(c[0].it); continue; }
+    const base = c[0], n = base.it.rays.length;
+    const along = (p, i) => (p[0] - base.it.rays[i].a[0])*base.w[i][0] + (p[1] - base.it.rays[i].a[1])*base.w[i][1];
+    const spans = c.map(X => X.it.rays.map((r, i) => [along(r.a, i), along(r.b, i)]));   // each item's stretch, per ray
+    const cuts = [];                             // per ray, the distinct places any item starts or ends
+    for (let i = 0; i < n; i++){
+      const ts = spans.flatMap(s => s[i]).sort((p, q) => p - q), u = [];
+      for (const t of ts) if (!u.length || t - u[u.length - 1] > tol) u.push(t);
+      cuts.push(u);
+    }
+    const K = cuts[0].length;
+    const covers = (s, i, t) => s[i][0] - tol < t && t < s[i][1] + tol;
+    let ok = cuts.every(u => u.length === K);
+    const pieces = [];
+    for (let k = 0; ok && k + 1 < K; k++){
+      const mids = cuts.map(u => (u[k] + u[k + 1])/2);
+      const who = spans.map((s, j) => j).filter(j => covers(spans[j], 0, mids[0]));
+      if (!mids.every((t, i) => spans.every((s, j) => covers(s, i, t) === who.includes(j)))){ ok = false; break; }
+      if (!who.length) continue;               // a gap between them
+      pieces.push(base.it.rays.map((r, i) => {
+        const o = r.a, w = base.w[i], t0 = cuts[i][k], t1 = cuts[i][k + 1];
+        const pow = who.reduce((m, j) => m + c[j].it.rays[i].pc.pow, 0);
+        return { a:[o[0] + w[0]*t0, o[1] + w[1]*t0], b:[o[0] + w[0]*t1, o[1] + w[1]*t1], pc:{ ...r.pc, pow } };
+      }));
+    }
+    if (!ok){ for (const X of c) out.push(X.it); continue; }
+    for (const rays of pieces) out.push({ ...base.it, rays });
+  }
+  return out;
+}
+/* Opacity in proportion to power: a beam carrying an eighth of the light is an eighth as strong. */
+const rayOpacity = pow => fx(0.9*Math.min(pow, 1));
 function paintRays(fig){
   const { pal, layers } = fig, groups = new Map();   // one path per ray and power level
   // LED rays are drawn from its die (display only).
@@ -2966,8 +3067,9 @@ function paintRays(fig){
     const s0 = fig.tr.segs[seg], r = sourceShape(src, Math.max(9, src.w0*fig.K*fig.S)).r;
     dies.set(seg, lensToScreen(fig.P(s0.p0), s0.dir)(-LED_DIE*r, 0));
   }
-  for (const { pc, a, b } of rayEnds(fig)){
-    if (pc.draw === "fill") continue;            // an axicon's edge ray bounds the shaded beam only
+  const lone = rayEnds(fig).filter(e => e.pc.draw !== "fill")   // an axicon's edge ray bounds the shaded beam only
+    .map(e => ({ key:fig.tr.segs[e.pc.seg].src.id + "|" + e.pc.nm, rays:[e] }));
+  for (const { rays:[{ pc, a, b }] } of sumCoincident(lone)){   // recombined light drawn once, its powers summed
     const key = pc.id + ":" + pc.pow.toFixed(3);
     let grp = groups.get(key);
     if (!grp) groups.set(key, grp = { d:"", nm:pc.nm, pow:pc.pow, src:fig.tr.segs[pc.seg].src });
@@ -2985,12 +3087,12 @@ function paintRays(fig){
 /* Beam: the fan filled. Neighbouring rays (ri, ri + 1) in a segment bound a quad; unbroken
    stretches merge into one outline unless rays cross (a focus), where pieces go in alone, split at
    the crossing. Stopped rays leave gaps (an annular stop gives an annular beam).
-   One path per line per power level (BEAM_LEVEL halvings), all wound CCW so the non-zero rule fills
+   One path per line per power level (BEAM_LEVEL, to 0.1%), all wound CCW so the non-zero rule fills
    overlaps once. Edge rays are drawn thin over the fill; a single ray is drawn as a ray.
    Where a source's lines share rays (within SAME_FAN), the segment is painted once in their mean
    colour (beam-s1 beside beam-s1_450). */
 const SAME_RAY = 0.05, SAME_FAN = 0.1;           // figure units; fraction of the fan's width
-const BEAM_LEVEL = pow => Math.round(Math.log2(Math.max(pow, 1e-6)));
+const BEAM_LEVEL = pow => Math.round(Math.max(pow, 0)*1000);   // power to 0.1%: each group is drawn at its own power
 const area2 = poly => { let a = 0; for (let i = 0; i < poly.length; i++){ const p = poly[i], q = poly[(i + 1) % poly.length]; a += p[0]*q[1] - q[0]*p[1]; } return a; };
 const wound = poly => area2(poly) < 0 ? poly.slice().reverse() : poly;   // screen y runs down: positive = CCW on the page
 function crossAt(a0, b0, a1, b1){               // where segments a0b0 and a1b1 cross strictly inside both, else null
@@ -3034,7 +3136,7 @@ function paintBeam(fig, under = false){         // under: only the fill, the ray
   }
   const groups = new Map();                      // one path per source, line(s) and power level
   const group = (src, line, pow) => {
-    const key = src.id + "|" + line.key + "|" + BEAM_LEVEL(pow);
+    const key = src.id + "|" + line.key + "|" + BEAM_LEVEL(pow);   // groups fill once, so one power each
     if (!groups.has(key)) groups.set(key, { d:"", edges:"", lines:"", c:line.c, pow:0, name:line.name });
     const g = groups.get(key); g.pow = Math.max(g.pow, pow);
     return g;
@@ -3065,7 +3167,8 @@ function paintBeam(fig, under = false){         // under: only the fill, the ray
       painted.push({ seg, rays:st.rays, line:{ key:String(pc.ci), c:lineColor(src, pc.nm), name:src.id + "_" + fmtNm(pc.nm) } });
     }
   }
-  for (const { seg, rays, line } of painted){
+  const merged = sumCoincident(painted.map(p => ({ ...p, key:fig.tr.segs[p.seg].src.id + "|" + p.line.key })));   // recombined light drawn once, its powers summed
+  for (const { seg, rays, line } of merged){
     const src = fig.tr.segs[seg].src;
     for (let i = 0; i < rays.length; ){           // unbroken stretches of the fan: consecutive ri
       let j = i;
@@ -3082,11 +3185,11 @@ function paintBeam(fig, under = false){         // under: only the fill, the ray
   for (const g of groups.values()){
     const k = seen.get(g.name) || 0; seen.set(g.name, k + 1);
     const tag = "beam-" + g.name + (k ? "." + k : "");
-    if (g.d) layers.beam.push(`<path id="${tag}" d="${g.d}" fill="${rgb(g.c)}" fill-opacity="${fx((pal.dark ? 0.58 : 0.4)*(0.35 + 0.65*g.pow))}"`
+    if (g.d) layers.beam.push(`<path id="${tag}" d="${g.d}" fill="${rgb(g.c)}" fill-opacity="${fx((pal.dark ? 0.58 : 0.4)*Math.min(g.pow, 1))}"`
       + ` fill-rule="nonzero" stroke="none"/>`);
     if (under) continue;
     if (g.edges) layers.beam.push(`<path id="${tag}-edges" d="${g.edges}" fill="none" stroke="${strokeOf(pal, g.c)}"`
-      + ` stroke-width=".8" stroke-opacity="${fx(0.8*(0.3 + 0.7*g.pow))}" stroke-linecap="round"/>`);
+      + ` stroke-width=".8" stroke-opacity="${fx(0.8*Math.min(g.pow, 1))}" stroke-linecap="round"/>`);
     if (g.lines) layers.beam.push(`<path id="${tag}-rays" d="${g.lines}" fill="none" stroke="${strokeOf(pal, g.c)}"`
       + ` stroke-width="1" stroke-opacity="${rayOpacity(g.pow)}" stroke-linecap="round"/>`);
   }
@@ -5292,7 +5395,7 @@ function toggleShutter(el){
 function nudgeOptic(o, [kx, ky], coarse){
   const el = o.el;
   if (el.type === "link"){ flashStatus("A link's distance follows its optic"); return; }
-  if (el._aimD){ flashStatus(`${el._tag}'s distance is set by a link`); return; }
+  if (el._aimD){ flashStatus(`${el._tag} is aimed at the next link  ·  turn off Aim at next to move it`); return; }
   const node = nodeOf(el.id); if (!node) return;
   const seg = tr.segs[node.segIn], dot = kx*seg.dir.x + ky*seg.dir.y;
   if (Math.abs(dot) < 0.3){                      // across: a roof shifts sideways
@@ -5334,11 +5437,11 @@ function turnSelected(step){
   const turn = a => ui.snap ? nextRot(a, sg, coarse) : a + step;
   let obj, key, v;
   if (src){
-    if (src._aim){ flashStatus(`${sourceLabel(src)} is aimed by a link`); return; }
+    if (src._aim){ flashStatus(`${sourceLabel(src)} is aimed at the next link  ·  turn off Aim at next to turn it`); return; }
     obj = src; key = "rot"; v = wrapDeg(turn(src.rot), 180);
   } else if (o){
     const el = realEl(o.el); if (!el) return;
-    if (el._aim && el.type !== "scanner"){ flashStatus(`${el._tag}'s angle is set by a link`); return; }   // a polygon still spins
+    if (el._aim && el.type !== "scanner"){ flashStatus(`${el._tag} is aimed at the next link  ·  turn off Aim at next to turn it`); return; }   // a polygon still spins
     obj = el;
     const n = nodeOf(el.id), tin = n ? Math.atan2(n.dirIn.y, n.dirIn.x)/RAD : 0;   // the way the light comes in, on the page
     if (el.type === "scanner"){ key = "rot"; v = wrapDeg(turn(el.rot), 180); }   // a polygon spins: the beam swings twice as far
@@ -5724,6 +5827,9 @@ function tryJoin(holder, key, target, tail0){
   if (!h || h.n.el !== target) return null;
   const { op } = autoJoin(holder, key, target, h); if (!op) return null;
   const list = listOf(holder, key), oldTail = holder[key], undoAims = aimState(), id0 = nextId;
+  const st = steererOf(s), steer = st && (st.src || st.fiber || st.node.el);   // joining aims it: "Aim at next" back on
+  const aimWas = steer ? steer.aim : undefined;
+  if (steer) delete steer.aim;
   const { first, rest, tail } = op.make(), added = [first, ...rest];
   first.tail0 = tail0 ?? oldTail;
   giveIds(added);
@@ -5733,6 +5839,7 @@ function tryJoin(holder, key, target, tail0){
   indexScene(); tr = trace(scene);
   const undo = () => {
     list.splice(list.length - added.length, added.length); holder[key] = oldTail;
+    if (aimWas === false) steer.aim = false;
     undoAims(); nextId = id0;                    // the aiming turned and slid optics: put them back
     indexScene(); tr = trace(scene);
   };
@@ -6017,10 +6124,10 @@ const EDITORS = {
                                   ["objective", "Objective"], ["tube", "Tube"]], el.shape)
     + `<label class="chk"><input type="checkbox" name="flip" ${el.flip ? "checked" : ""}> Flip orientation</label>`
     + `<label class="chk"><input type="checkbox" name="showF" ${el.showF ? "checked" : ""}> Display focal length</label>`,
-  mirror: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el))
+  mirror: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + aimToggle(el)
     + choice("Display", "mount", [["plain", "Mirror"], ["galvo", "Galvo"], ["mems", "MEMS mirror"]], el.mount || "plain"),
   scanner: el => numField("Facets", "facets", el.facets, 1, "", ' min="3" max="72"')
-    + numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el))
+    + numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + aimToggle(el)
     + numField("Rotation", "rot", el.rot, rotField(1), "°"),
   retro: el => numField("Offset", "off", el.off, 1, "mm") + numField("Tilt", "tilt", el.tilt, rotField(1), "°", ' min="-40" max="40"'),
   pair: el => numField("Angle", "angle", el.angle, rotField(5), "°")
@@ -6041,17 +6148,17 @@ const EDITORS = {
   shutter: el => heading("State") + radios("shutState", [["open", "Open"], ["closed", "Closed"]], el.open ? "open" : "closed"),
   diffuser: el => numField("Scatter ½-angle", "scatter", el.scatter, 1, "°", ' min="0" max="60"')
     + `<div class="row"><label>Pattern</label><button class="mini" data-reseed>Reroll</button></div>`,
-  curved: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el))
+  curved: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + aimToggle(el)
     + numField("Focal length", "f", el.f, 5, "mm") + readout("Tangential f", "ft", el),
   filter: el => numField("Center", "cwl", el.cwl, 5, "nm") + numField("Bandwidth", "bw", el.bw, 5, "nm"),
-  splitter: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el))
+  splitter: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + aimToggle(el)
     + numField("Reflects", "R", el.R, 5, "%", ' min="1" max="100"') + bodyEditor(el),
-  dichroic: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el))
+  dichroic: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + aimToggle(el)
     + `<div class="row"><label>Filter</label><select data-k="pass" class="wl-select">`
     + `<option value="longpass" ${el.pass === "longpass" ? "selected" : ""}>Longpass · reflects short</option>`
     + `<option value="shortpass" ${el.pass === "longpass" ? "" : "selected"}>Shortpass · reflects long</option></select></div>`
     + numField("Cut wavelength", "cut", el.cut, 10, "nm") + bodyEditor(el),
-  pbs: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + bodyEditor(el),
+  pbs: el => numField("Angle", "angle", el.angle, rotField(5), "°", aimAttr(el)) + aimToggle(el) + bodyEditor(el),
   qwp: el => numField("Fast axis", "axis", el.axis, 1, "°", POL_ANGLE),
   detector: () => "",                            // sizes and readouts follow the aperture
   block:    () => "",
@@ -6093,7 +6200,7 @@ const EDITORS = {
       + heading("Output end") + end("outEnd", "fOut")
       + numField("Position x", "ox", el.ox, ui.snap ? GRID : 1, "mm", el._aimB ? " disabled" : "")
       + numField("Position y", "oy", el.oy, ui.snap ? GRID : 1, "mm", el._aimB ? " disabled" : "")
-      + numField("Rotation", "orot", el.orot, rotField(5), "°", aimAttr(el))
+      + numField("Rotation", "orot", el.orot, rotField(5), "°", aimAttr(el)) + aimToggle(el)
       + (hasCollimator(el) ? numField("Collimator CA Ø", "apD", fx(el.ap*2), 0.5, "mm") : "")
       + fiberReadout(el);
   },
@@ -6139,6 +6246,10 @@ function harmonicReadout(el){
 }
 /* Link-solved fields are read-only. */
 const aimAttr = el => el._aim ? " disabled" : "";
+/* "Aim at next": shown where a link follows to aim at; off leaves the optic as set. setAim stores only off. */
+const setAim = (o, on) => { if (on) delete o.aim; else o.aim = false; };
+const aimToggle = o => o._aim || o._aimOff
+  ? `<label class="chk"><input type="checkbox" name="aim" ${o.aim === false ? "" : "checked"}> Aim at next</label>` : "";
 function glassSelect(el){                        // "Custom" is listed only while it is the state
   return `<div class="row"><label>Glass</label><select name="glass" class="wl-select field-sel">`
     + (el.glass ? "" : `<option value="" selected>Custom</option>`)
@@ -6238,7 +6349,7 @@ function buildProps(){
           `<button class="sw${src.color === c ? " on" : ""}" data-color="${c}" role="radio" aria-checked="${src.color === c}" aria-label="${name}" style="background:${c}"></button>`).join("") + `</div>` : "")
       + numField("Position x", "x", src.x, pstep, "mm", src._aimD ? " disabled" : "")
       + numField("Position y", "y", src.y, pstep, "mm", src._aimD ? " disabled" : "")
-      + numField("Rotation", "rot", src.rot, rotField(5), "°", aimAttr(src))
+      + numField("Rotation", "rot", src.rot, rotField(5), "°", aimAttr(src)) + aimToggle(src)
       + numField("Beam Ø", "w0D", fx(src.w0*2), .2, "mm")
       + numField("Divergence ½-angle", "theta", src.theta, .5, "°")
       + numField("Rays", "rays", src.rays, 2, "")
@@ -6563,6 +6674,7 @@ props.addEventListener("change", e => {          // radios, checkboxes and the m
       commit();
     }
     else if (t.name === "polMode"){ src.polMode = t.value; commit(); }
+    else if (t.name === "aim"){ setAim(src, t.checked); commit(); }
     return;
   }
   const o = selectedElement(); if (!o) return;
@@ -6573,6 +6685,7 @@ props.addEventListener("change", e => {          // radios, checkboxes and the m
     commit();
   }
   else if (t.name === "flip"){ el.flip = t.checked; commit({ keepProps:true }); }
+  else if (t.name === "aim"){ setAim(el, t.checked); commit(); }   // fields it locks open or close
   else if (t.name === "shutState"){ el.open = t.value === "open"; commit({ keepProps:true }); }
   else if (t.name === "effect"){ el.effect = t.value; commit(); }   // the panel shows the other setting's fields
   else if (t.name === "showF"){ el.showF = t.checked; commit({ keepProps:true }); }
@@ -6933,6 +7046,8 @@ function cleanElement(raw, ctx, depth){
   for (const [k, v] of Object.entries(raw))       // fields without a default (a lens's flip): plain values only
     if (!(k in el) && !COMMON_KEYS.has(k) && k !== "arms" && !k.startsWith("_") && (typeof v === "boolean" || (typeof v === "number" && isFinite(v))))
       el[k] = v;
+  if (el.aim !== false) delete el.aim;           // "Aim at next": stored only when off
+  if (el.type === "mirror" || el.type === "curved") delete el.tilt;   // an interim mirror tilt: off line is now "Aim at next" off
   if (el.type === "pair"){ delete el.bounces; delete el.gdd; }   // legacy pair bounce count (now length) and GDD note
   if (el.type === "faraday") delete el.lam0;      // legacy design wavelength: rotators are now achromatic
   if (HARMONIC[el.type]) delete el.axis;          // legacy phase-matching axis (normalizeSource)
@@ -6949,6 +7064,7 @@ function cleanSource(s, ctx){
       out.lambdas = l.length ? l.map(x => clamp(Math.round(x), 200, WLMAX)) : defs.lambdas;
     } else out[k] = cleanValue(k, s[k], defs[k]);
   }
+  if (s.aim === false) out.aim = false;          // "Aim at next" off
   out.chain = cleanList(s.chain, ctx, 0);
   return out;
 }
